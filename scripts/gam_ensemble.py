@@ -1,71 +1,11 @@
 import pyleogrid as pg
 import numpy as np
 import pygam
-import pandas as pd
-from itertools import product
-import xarray as xr
 import datetime as dt
+import pandas as pd
+import xarray as xr
 from sklearn.neighbors import BallTree
 import distributed
-
-
-def fit_model(df, min_overlap=100):
-    t0 = dt.datetime.now()
-    df = df.sort_values(['TSid', 'age'])
-
-    ensemble = pg.Ensemble(df.set_index('age'), ds_id='TSid',
-                           climate='temperature')
-    ds = ensemble.input_data
-    age_ensemble = ensemble.sample_ages(size=1000, use_dask=False)
-    temp_ensemble = age_ensemble.rename('temperature_ensemble').copy(
-        data=np.random.normal(ds.temperature, ds.temp_unc,
-                              size=age_ensemble.shape))
-    ensemble.input_data['temperature_ensemble'] = temp_ensemble
-
-    ensemble.input_data = ds = align_ensembles(ensemble.input_data,
-                                               min_overlap=min_overlap)
-
-    # remove the anomaly for the aligned data
-    aligned_ids = np.where(ds.aligned)[0]
-    aligned = ds.isel(age=aligned_ids)
-    # define modern via worldclim reference: 1970-2000
-    modern = is_between(aligned.age_ensemble, -50, -20).values
-    if modern.sum() > 100:
-        mean = aligned.temperature_ensemble.values[modern].mean()
-    else:
-        mean = aligned.modern.values[np.newaxis]
-    ds['temperature_ensemble'][:, aligned_ids] -= mean
-
-    # remove anomaly for non-aligned data
-    nonaligned = ds.TSid.where(~ds.aligned, drop=True)
-
-    for ts_id in np.unique(nonaligned):
-        ids = np.where(ds.TSid == ts_id)[0]
-        sub = ds.isel(age=ids)
-        modern = is_between(sub.age_ensemble, -50, -20).values
-        if modern.sum() >= 100:
-            mean = sub.temperature_ensemble.values[modern].mean()
-        else:
-            mean = sub.modern.values[np.newaxis]
-        ds['temperature_ensemble'][:, ids] -= mean
-
-    # insert 0s for every timeseries in the ensemble for the reference period
-    # at -35 BP (1985)
-    zeros = np.zeros(df.TSid.unique().size * 1000)
-    x = np.r_[ds.age_ensemble.values.ravel(), zeros - 35]
-    y = np.r_[ds.temperature_ensemble.values.ravel(), zeros]
-
-    gam = pygam.LinearGAM(pygam.s(0)).gridsearch(
-        x[:, np.newaxis], y, progress=False)
-
-    time_needed = (dt.datetime.now() - t0).total_seconds()
-
-    ensemble.input_data['time_needed'] = xr.Variable(
-        (), time_needed, attrs={
-            'long_name': 'For sampling and fitting the GAM',
-            'units': 'seconds'})
-
-    return gam, ensemble
 
 
 def is_between(da, left, right):
@@ -111,72 +51,6 @@ def align_ensembles(ds, min_overlap=100):
     return aligned
 
 
-def get_series_overlap(s1, s2):
-    return (s1.between(s2.min(), s2.max()),
-            s2.between(s1.min(), s1.max()))
-
-
-def align_timeseries(df):
-    # get the time series with the longest record
-    not_used = set(df.TSid.unique())
-    df = df.set_index('TSid')
-    max_id = df.groupby(level=0).age.agg(lambda s: s.max() - s.min()).idxmax()
-    not_used -= {max_id}
-    found_overlap = True
-    df['aligned'] = False
-    aligned = df.loc[max_id].copy()
-
-    while not_used and found_overlap:
-        found_overlap = False
-        for ts_id in not_used:
-            m1, m2 = get_series_overlap(aligned.age, df.loc[ts_id, 'age'])
-            if m1.any():
-                found_overlap = True
-                ts_df = df.loc[ts_id].copy()
-                diff = aligned[m1].temperature.mean() - \
-                    ts_df[m2].temperature.mean()
-                ts_df['temperature'] = ts_df['temperature'] + diff
-                aligned = pd.concat([aligned, ts_df])
-                not_used -= {ts_id}
-                break
-
-    aligned['aligned'] = True
-    if not_used:
-        aligned = pd.concat([aligned, df.loc[sorted(not_used)]])
-    return aligned.reset_index()
-
-
-def worker(key):
-    return fit_model(key[1])
-
-
-def test_align_timeseries():
-    longest = pd.DataFrame({
-        'TSid': [1] * 6,
-        'age': np.arange(6),
-        'temperature': np.arange(6)})
-
-    overlapping = pd.DataFrame({
-        'TSid': [2] * 3,
-        'age': np.arange(2, 5) + 0.5,
-        'temperature': np.arange(2, 5) - 2})
-
-    not_overlapping = pd.DataFrame({
-        'TSid': [3] * 3,
-        'age': [7, 8, 9],
-        'temperature': [-1] * 3})
-
-    combined = pd.concat([longest, overlapping, not_overlapping],
-                         ignore_index=True)
-
-    aligned = align_timeseries(combined).set_index('TSid')
-    assert aligned.loc[1, 'aligned'].all()
-    assert aligned.loc[2, 'aligned'].all()
-    assert not aligned.loc[3, 'aligned'].any()
-    assert np.all(
-        aligned.loc[2, 'temperature'] == overlapping.temperature.values + 2.5)
-
-
 class GAMEnsemble(pg.Ensemble):
     """A :class:`pyleogrid.Ensemble` using pseudo-gridding with GAM"""
 
@@ -217,13 +91,16 @@ class GAMEnsemble(pg.Ensemble):
         self.input_data[lonname] = (agedim, full_coords[lonname])
         self.input_data[latname] = (agedim, full_coords[latname])
 
-        self.input_data = self.input_data.set_coords([lonname, latname])
+        self.input_data = self.input_data.set_coords(
+            [lonname, latname]).sortby(
+                [latname, lonname, conf.ds_id, conf.age])
 
         return self.input_data[lonname], self.input_data[latname]
 
     def predict(
             self, age=None, climate=None, target=None,
             size=None, client=None, quantiles=None, return_gam=False,
+            return_time=False,
             **kwargs):
 
         conf = self.config
@@ -245,12 +122,10 @@ class GAMEnsemble(pg.Ensemble):
             if climate is None:
                 raise ValueError("No climate data found!")
 
-        data = self.input_data.copy()
+        data = self.input_data
 
         data[conf.climate + '_ensemble'] = climate
         data[conf.age + '_ensemble'] = age
-
-        agedim = age.dims[-1]
 
         output = target.psy.base.copy()
 
@@ -259,28 +134,32 @@ class GAMEnsemble(pg.Ensemble):
         nt = output.dims[time]
         ns = output.dims[space]
 
+        encoding = dict(coordinates=f'{clon.name} {clat.name}')
+
         output[conf.climate] = target.copy(
             data=np.full(target.shape, np.nan))
         if quantiles is not None:
-            output[conf.climate + '_quantiles'] = (
+            output[conf.climate + '_quantiles'] = xr.Variable(
                 (time, space, 'quantile'),
-                np.full((nt, ns, len(quantiles)), np.nan))
+                np.full((nt, ns, len(quantiles)), np.nan),
+                encoding=encoding)
             output['quantile'] = ('quantile', quantiles)
         if size is not None:
-            output[conf.climate + '_samples'] = (
-                (time, conf.ensemble, space), np.full((nt, size, ns), np.nan))
+            output[conf.climate + '_samples'] = xr.Variable(
+                (time, conf.ensemble, space), np.full((nt, size, ns), np.nan),
+                encoding=encoding)
         if return_gam:
-            output[conf.climate + '_model'] = (
-                space, np.full(ns, object, dtype=object))
+            output[conf.climate + '_model'] = xr.Variable(
+                space, np.full(ns, object, dtype=object),
+                encoding=encoding)
+        if return_time:
+            output['time_needed'] = xr.Variable(
+                space, np.zeros(ns, int), encoding=encoding)
 
         time = target.coords[target.dims[0]].values
 
         kwargs.update(dict(time=time, quantiles=quantiles, size=size,
                            return_gam=return_gam))
-
-        grouped = data.groupby(
-            xr.DataArray(pd.MultiIndex.from_arrays([clon.values, clat.values]),
-                         dims=(agedim, ), name=agedim))
 
         target_idx = pd.MultiIndex.from_arrays(
             [target.psy.decoder.get_x(target.psy[0]).values,
@@ -305,7 +184,8 @@ class GAMEnsemble(pg.Ensemble):
                 for sl in locs:
                     yield self._predict_cell_static(sl, **kwargs)
 
-        for ret in pg.utils.log_progress(iterate(), len(grouped.groups)):
+        for ret in pg.utils.log_progress(
+                iterate(), len(coords.drop_duplicates())):
             key = ret[0]
             i = target_idx.get_loc(coords[key][0])
             try:
@@ -322,12 +202,17 @@ class GAMEnsemble(pg.Ensemble):
                 j += 1
             if return_gam:
                 output[conf.climate + '_model'][i] = ret[j]
+                j += 1
+            if return_time:
+                output['time_needed'][i] = ret[j]
 
         return output
 
     def _predict_cell(self, locs, time, quantiles=None, size=None,
                       align=True, anomalies=True, min_overlap=100,
-                      return_gam=False, max_time_diff=200):
+                      return_gam=False, max_time_diff=200, return_time=False):
+
+        t0 = dt.datetime.now()
 
         conf = self.config
 
@@ -408,6 +293,9 @@ class GAMEnsemble(pg.Ensemble):
                 arr[idx] = np.nan
         if return_gam:
             ret = ret + (gam, )
+
+        if return_time:
+            ret = ret + ((dt.datetime.now() - t0).total_seconds(), )
 
         return ret
 
