@@ -241,7 +241,7 @@ class GAMEnsemble(pg.Ensemble):
             elif aligned.datum[aligned.alignment_base][0] == 'anom':
                 mean = 0
             else:
-                mean = aligned[modern].values[np.newaxis]
+                mean = aligned[modern][aligned.alignment_base][0].values
             ds[climate][:, aligned_ids] -= mean
 
             # remove anomaly for non-aligned data
