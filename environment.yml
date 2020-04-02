@@ -24,6 +24,7 @@ dependencies:
     - xlrd
     - openpyxl
     - geopandas
+    - seaborn
     - pip:
         - lipd
         - latlon-utils
