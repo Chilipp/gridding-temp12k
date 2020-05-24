@@ -1,3 +1,4 @@
+import asyncio
 import pyleogrid as pg
 import numpy as np
 import pygam
@@ -7,7 +8,7 @@ import pandas as pd
 import xarray as xr
 from sklearn.neighbors import BallTree
 import distributed
-
+from contextlib import contextmanager
 
 def is_between(da, left, right):
     return (da >= left) & (da <= right)
@@ -17,6 +18,15 @@ def get_ensemble_overlap(ens1, ens2):
     return (is_between(ens1, ens2.min(), ens2.max()),
             is_between(ens2, ens1.min(), ens1.max()))
 
+def run_with_timeout(func, timeout, *args, **kwargs):
+    async def main():
+        try:
+            ret = await asyncio.wait_for(func(*args, **kwargs), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        else:
+            return ret
+    return asyncio.run(main())
 
 class GAMEnsemble(pg.Ensemble):
     """A :class:`pyleogrid.Ensemble` using pseudo-gridding with GAM"""
@@ -67,7 +77,7 @@ class GAMEnsemble(pg.Ensemble):
     def predict(
             self, age=None, climate=None, target=None,
             size=None, client=None, quantiles=None, return_gam=False,
-            return_time=False, return_counts=False,
+            return_time=False, return_counts=False, timeout=6000,
             **kwargs):
 
         conf = self.config
@@ -123,7 +133,7 @@ class GAMEnsemble(pg.Ensemble):
                 encoding=encoding)
         if return_time:
             output['time_needed'] = xr.Variable(
-                space, np.zeros(ns, int), encoding=encoding)
+                space, np.zeros(ns, float), encoding=encoding)
         if return_counts:
             output['nsamples'] = target.copy(
                 data=np.full(target.shape, np.nan))
@@ -131,6 +141,7 @@ class GAMEnsemble(pg.Ensemble):
         time = target.coords[target.dims[0]].values
 
         kwargs.update(dict(time=time, quantiles=quantiles, size=size,
+                           return_time=return_time, timeout=timeout,
                            return_gam=return_gam, return_counts=return_counts))
 
         target_idx = pd.MultiIndex.from_arrays(
@@ -179,11 +190,11 @@ class GAMEnsemble(pg.Ensemble):
             if return_gam:
                 output[conf.climate + '_model'][i] = ret[j]
                 j += 1
-            if return_time:
-                output['time_needed'][i] = ret[j]
-                j += 1
             if return_counts:
                 output['nsamples'][:, i] = ret[j]
+                j += 1
+            if return_time:
+                output['time_needed'][i] = ret[j]
                 j += 1
 
         return output
@@ -193,7 +204,7 @@ class GAMEnsemble(pg.Ensemble):
                       align=True, anomalies=True, min_overlap=100,
                       return_gam=False, max_time_diff=200, return_time=False,
                       modern_young=-50, modern_old=-20, ensemble_cls=None,
-                      use_gam=True, return_counts=False):
+                      use_gam=True, return_counts=False, timeout=6000):
 
         t0 = dt.datetime.now()
 
@@ -215,7 +226,8 @@ class GAMEnsemble(pg.Ensemble):
                 ds, conf, modern_young, modern_old)
 
         if use_gam:
-            ret = ensemble_cls._predict_gam(
+            ret = run_with_timeout(
+                ensemble_cls._predict_gam, timeout, 
                 ds, conf, time, quantiles, size, return_gam,
                 return_counts, max_time_diff)
         else:
@@ -230,7 +242,7 @@ class GAMEnsemble(pg.Ensemble):
         return (key, ) + ret
 
     @staticmethod
-    def _predict_gam(ds, conf, time, quantiles=None, size=None,
+    async def _predict_gam(ds, conf, time, quantiles=None, size=None,
                      return_gam=False,  return_counts=False,
                      max_time_diff=200):
         # insert 0s for every timeseries in the ensemble for the reference
@@ -264,7 +276,7 @@ class GAMEnsemble(pg.Ensemble):
         if return_counts:
             tree = BallTree(ds[age].values.ravel()[:, np.newaxis])
             counts = tree.query_radius(time[:, np.newaxis], return_counts,
-                                       count_only=True)
+                                       count_only=True).astype(float)
             ret = ret + (counts, )
 
         # look how many samples in the ensemble fall into the `max_time_diff`
