@@ -1,4 +1,6 @@
 import asyncio
+import warnings
+import time
 import pyleogrid as pg
 import numpy as np
 import pygam
@@ -9,6 +11,7 @@ import xarray as xr
 from sklearn.neighbors import BallTree
 import distributed
 from contextlib import contextmanager
+from scipy.interpolate import interp1d
 
 def is_between(da, left, right):
     return (da >= left) & (da <= right)
@@ -18,15 +21,6 @@ def get_ensemble_overlap(ens1, ens2):
     return (is_between(ens1, ens2.min(), ens2.max()),
             is_between(ens2, ens1.min(), ens1.max()))
 
-def run_with_timeout(func, timeout, *args, **kwargs):
-    async def main():
-        try:
-            ret = await asyncio.wait_for(func(*args, **kwargs), timeout=timeout)
-        except asyncio.TimeoutError:
-            return None
-        else:
-            return ret
-    return asyncio.run(main())
 
 class GAMEnsemble(pg.Ensemble):
     """A :class:`pyleogrid.Ensemble` using pseudo-gridding with GAM"""
@@ -77,7 +71,7 @@ class GAMEnsemble(pg.Ensemble):
     def predict(
             self, age=None, climate=None, target=None,
             size=None, client=None, quantiles=None, return_gam=False,
-            return_time=False, return_counts=False, timeout=6000,
+            return_time=False, return_counts=False,
             **kwargs):
 
         conf = self.config
@@ -141,7 +135,7 @@ class GAMEnsemble(pg.Ensemble):
         time = target.coords[target.dims[0]].values
 
         kwargs.update(dict(time=time, quantiles=quantiles, size=size,
-                           return_time=return_time, timeout=timeout,
+                           return_time=return_time,
                            return_gam=return_gam, return_counts=return_counts))
 
         target_idx = pd.MultiIndex.from_arrays(
@@ -204,7 +198,7 @@ class GAMEnsemble(pg.Ensemble):
                       align=True, anomalies=True, min_overlap=100,
                       return_gam=False, max_time_diff=200, return_time=False,
                       modern_young=-50, modern_old=-20, ensemble_cls=None,
-                      use_gam=True, return_counts=False, timeout=6000):
+                      use_gam=True, return_counts=False):
 
         t0 = dt.datetime.now()
 
@@ -226,8 +220,7 @@ class GAMEnsemble(pg.Ensemble):
                 ds, conf, modern_young, modern_old)
 
         if use_gam:
-            ret = run_with_timeout(
-                ensemble_cls._predict_gam, timeout, 
+            ret = ensemble_cls._predict_gam(
                 ds, conf, time, quantiles, size, return_gam,
                 return_counts, max_time_diff)
         else:
@@ -242,7 +235,7 @@ class GAMEnsemble(pg.Ensemble):
         return (key, ) + ret
 
     @staticmethod
-    async def _predict_gam(ds, conf, time, quantiles=None, size=None,
+    def _predict_gam(ds, conf, time, quantiles=None, size=None,
                      return_gam=False,  return_counts=False,
                      max_time_diff=200):
         # insert 0s for every timeseries in the ensemble for the reference
@@ -271,6 +264,7 @@ class GAMEnsemble(pg.Ensemble):
         if quantiles is not None:
             ret = ret + (gam.prediction_intervals(time, quantiles=quantiles), )
         if size is not None:
+
             ret = ret + (gam.sample(
                 x[:, np.newaxis], y, sample_at_X=time, n_draws=size).T, )
         if return_counts:
@@ -439,7 +433,7 @@ class GAMEnsemble(pg.Ensemble):
 
     def compute_anomalies(
             self, target=None, client=None, modern_young=-50, modern_old=-20,
-            inplace=True):
+            inplace=True, modern='modern'):
         """Align the ensembles per grid cell in the given target"""
 
         conf = self.config
@@ -460,7 +454,7 @@ class GAMEnsemble(pg.Ensemble):
             [clon.values, clat.values])
 
         kwargs = dict(modern_young=modern_young, modern_old=modern_old,
-                      conf=conf)
+                      conf=conf, modern=modern)
 
         def iterate():
             locs = map(coords.get_loc, coords.drop_duplicates())
@@ -479,9 +473,11 @@ class GAMEnsemble(pg.Ensemble):
                                                 **kwargs)
 
         datasets = []
-        for ret in pg.utils.log_progress(
-                iterate(), len(coords.drop_duplicates())):
-            datasets.append(ret)
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', '.*indexing past lexsort')
+            for ret in pg.utils.log_progress(
+                    iterate(), len(coords.drop_duplicates())):
+                datasets.append(ret)
 
         if len(datasets) > 1:
             ds = xr.concat(
@@ -508,23 +504,50 @@ class GAMEnsemble(pg.Ensemble):
 
         ds[anom_ref] = xr.zeros_like(ds[conf.age])
 
+        size = ds[age].shape[0]
+
+        try:
+            iter(modern_young)
+        except TypeError:
+            modern_young = [modern_young]
+            modern_old = [modern_old]
+            modern = [modern]
+
         # remove the anomaly for the aligned data
         if 'aligned' in ds:
             aligned_ids = np.where(ds.aligned)[0]
-            aligned = ds.isel(age=aligned_ids)
+            aligned = ds[{agedim: aligned_ids}]
             nonaligned = ds[conf.ds_id].where(~ds.aligned, drop=True)
 
-            # define modern via worldclim reference: 1970-2000
             is_modern = is_between(
-                aligned[age], modern_young, modern_old).values
-            if is_modern.sum() > 100:
-                mean = aligned[climate].values[is_modern].mean()
+                aligned[age], min(modern_young), max(modern_old)).values
+            if is_modern.sum() >= size / 10:
+                # The first number in modern_young represents the target (e.g.
+                # PI). Other supplied values represent alternative reference
+                # periods (e.g. WorldClim). We do a piecewise linear
+                # interpolation between these reference periods and calculate
+                # the anomaly of the given reference period with respect to the
+                # target (the first modern value). This is then subtracted from
+                # the data values to correct the data to the target time
+                base_aligned = aligned.where(
+                    aligned['alignment_base'], drop=True)
+                modern_vals = base_aligned[{agedim: 0}][modern].to_array().values
+                interpolator = interp1d(np.r_[modern_young, modern_old],
+                                        np.r_[modern_vals, modern_vals],
+                                        bounds_error=False)
+                modern_refs = aligned[age].values.copy()
+                modern_refs[:] = np.nan
+                modern_refs[is_modern] = interpolator(
+                    aligned[age].values[is_modern])
+                # this is 0 if the record falls within the target period
+                ref_anoms = modern_refs - base_aligned[modern[0]].values.mean()
+                mean = (aligned[climate].values[is_modern] -
+                        ref_anoms[is_modern]).mean()
             elif aligned.datum[aligned.alignment_base][0] == 'anom':
                 mean = 0
-            elif modern in aligned:
-                mean = aligned[modern][aligned.alignment_base][0].values
             else:
-                mean = np.nan
+                mean = aligned[modern[0]].values[np.newaxis]
+
             ds[climate].values[:, aligned_ids] = (
                 ds[climate].values[:, aligned_ids] - mean)
             ds[anom_ref].values[aligned_ids] = mean
@@ -535,15 +558,32 @@ class GAMEnsemble(pg.Ensemble):
         # remove anomaly for non-aligned data
         for ts_id in np.unique(nonaligned):
             ids = np.where(ds[conf.ds_id] == ts_id)[0]
-            sub = ds.isel(**{agedim: ids})
+            sub = ds[{agedim: ids}]
             is_modern = is_between(
-                sub[age], modern_young, modern_old).values
-            if is_modern.sum() >= 100:
-                mean = sub[climate].values[is_modern].mean()
-            elif sub.datum[sub.alignment_base][0] == 'anom':
+                sub[age], min(modern_young), max(modern_old)).values
+            if is_modern.sum() >= size / 10:
+                # The first number in modern_young represents the target (e.g.
+                # PI). Other supplied values represent alternative reference
+                # periods (e.g. WorldClim). We do a piecewise linear
+                # interpolation between these reference periods and calculate
+                # the anomaly of the given reference period with respect to the
+                # target (the first modern value). This is then subtracted from
+                # the data values to correct the data to the target time
+                modern_vals = sub[{agedim: 0}][modern].to_array().values
+                interpolator = interp1d(np.r_[modern_young, modern_old],
+                                        np.r_[modern_vals, modern_vals],
+                                        bounds_error=False)
+                modern_refs = sub[age].values.copy()
+                modern_refs[:] = np.nan
+                modern_refs[is_modern] = interpolator(
+                    sub[age].values[is_modern])
+                # this is 0 if the record falls within the target period
+                ref_anoms = modern_refs - sub[modern[0]].values
+                mean = (sub[climate].values[is_modern] - ref_anoms).mean()
+            elif sub.datum[0] == 'anom':
                 mean = 0
             else:
-                mean = sub[modern].values[np.newaxis]
+                mean = sub[modern[0]].values[np.newaxis]
             ds[climate].values[:, ids] = ds[climate].values[:, ids] - mean
             ds[anom_ref].values[ids] = mean
 
